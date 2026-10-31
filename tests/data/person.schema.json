@@ -1,0 +1,13 @@
+{"title":"Person","type":"object","additionalProperties":false,
+ "required":["name","age","address"],
+ "properties":{
+  "name":{"type":"string","minLength":1,"description":"Full name"},
+  "age":{"type":"integer","minimum":0,"maximum":150},
+  "email":{"type":["string","null"]},
+  "role":{"enum":["admin","user"]},
+  "tags":{"type":"array","items":{"type":"string"},"maxItems":3},
+  "address":{"$ref":"#/$defs/Address"},
+  "class":{"type":"boolean"},
+  "extra":{}
+ },
+ "$defs":{"Address":{"type":"object","required":["zip"],"properties":{"zip":{"type":"string"},"lines":{"type":"array","items":{"type":"object","properties":{"t":{"type":"number"}}}}}}}}

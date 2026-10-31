@@ -1,0 +1,4 @@
+[submodule "third_party/wuffs"]
+	path = third_party/wuffs
+	url = git@github.com:google/wuffs.git
+	branch = v0.3

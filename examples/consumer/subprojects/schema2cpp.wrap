@@ -1,0 +1,8 @@
+[wrap-git]
+url = https://github.com/YOURNAME/schema2cpp.git
+revision = v0.1.0
+depth = 1
+
+[provide]
+dependency_names = s2c_runtime, s2c_headers
+program_names = schema2cpp
