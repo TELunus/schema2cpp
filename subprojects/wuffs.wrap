@@ -1,0 +1,5 @@
+[wrap-git]
+url = https://github.com/google/wuffs.git
+revision = v0.3.6
+depth = 1
+patch_directory = wuffs

@@ -48,11 +48,7 @@ Recursive schemas, union types and non-string enums are rejected.
 
 ## Building
 
-Ensure you've got the `third_party/wuffs` submodule:
-```
-git submodule update --init
-```
-Then build with meson
+Build with meson
 ```
 meson setup buildDir
 meson test -C buildDir

@@ -7,7 +7,10 @@ project(
 )
 
 src_inc   = include_directories('src')
-wuffs_inc = include_directories('third_party/wuffs')
+
+# wuffs meson subproject
+wuffs_proj = subproject('wuffs')
+wuffs_inc = wuffs_proj.get_variable('wuffs_inc')
 
 # Runtime: JSON parsing (Wuffs) + validation helpers used by generated classes.
 # Wuffs is a big C file, so silence warnings for this one target.

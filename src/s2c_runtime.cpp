@@ -7,7 +7,7 @@
 #define WUFFS_CONFIG__MODULES
 #define WUFFS_CONFIG__MODULE__BASE
 #define WUFFS_CONFIG__MODULE__JSON
-#include "third_party/wuffs/release/c/wuffs-v0.3.c"
+#include "wuffs-v0.3.c"
 
 #include <cmath>
 #include <cstdlib>
