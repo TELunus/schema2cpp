@@ -6,6 +6,9 @@
 // header also gets an accessor returning that data as a ready-built object (no runtime
 // parsing); generation fails if the data does not match.
 //
+// Each generated class also has update(json_text), which writes the object's members back into
+// a JSON document and keeps whatever the schema does not describe.
+//
 // Each generated class has constructors that take JSON text (or an already
 // parsed s2c::Value) and throw s2c::ParseError (malformed JSON) or
 // s2c::ValidationError (JSON that doesn't match the schema).
@@ -52,7 +55,9 @@ const std::set<std::string> kKeywords = {
     "operator", "or", "private", "protected", "public", "register", "return", "short", "signed",
     "sizeof", "static", "struct", "switch", "template", "this", "throw", "true", "try",
     "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual", "void",
-    "volatile", "while", "xor", "NULL", "jobj", "jpath", "Tag"};
+    "volatile", "while", "xor", "NULL", "jobj", "jpath", "Tag",
+    // names of generated methods and of locals inside them
+    "update", "to_value", "jexisting", "jw"};
 
 std::string ident(const std::string& s, const std::string& class_name) {
   std::string out;
@@ -118,9 +123,10 @@ std::string opt_size(const Value& obj, const char* key) {
 struct Resolved {
   std::string type;    // C++ type of the member
   std::string reader;  // C++ expression producing a reader for that type
+  std::string writer;  // C++ expression producing the matching writer (see s2c_runtime.hpp)
   std::string cls;     // generated class name, if this is an object class
-  Resolved(std::string t = "", std::string r = "", std::string c = "")
-      : type(std::move(t)), reader(std::move(r)), cls(std::move(c)) {}
+  Resolved(std::string t = "", std::string r = "", std::string w = "", std::string c = "")
+      : type(std::move(t)), reader(std::move(r)), writer(std::move(w)), cls(std::move(c)) {}
 };
 
 struct TypeInfo {
@@ -237,7 +243,7 @@ class Generator {
   }
 
   Resolved resolve_uncached(const Value& schema, const std::string& name_hint) {
-    if (schema.type() == Value::Type::Bool) return {"s2c::Value", "s2c::any_reader()"};
+    if (schema.type() == Value::Type::Bool) return {"s2c::Value", "s2c::any_reader()", "s2c::any_writer()"};
     if (schema.type() != Value::Type::Object) die("a schema must be an object or boolean");
 
     if (const Value* ref = get(schema, "$ref")) {
@@ -277,7 +283,8 @@ class Generator {
       std::string list;
       for (size_t i = 0; i < allowed.size(); ++i) list += (i ? ", " : "") + cpp_str(allowed[i]);
       r = {"std::string", "s2c::string_reader(" + opt_size(schema, "minLength") + ", " +
-                              opt_size(schema, "maxLength") + ", {" + list + "})"};
+                              opt_size(schema, "maxLength") + ", {" + list + "})",
+           "s2c::string_writer()"};
     } else if (type == "integer") {
       auto lo = get_num(schema, "minimum"), hi = get_num(schema, "maximum");
       r = {"std::int64_t",
@@ -285,31 +292,35 @@ class Generator {
                (lo ? std::to_string(static_cast<long long>(std::ceil(*lo))) : std::string("std::nullopt")) +
                ", " +
                (hi ? std::to_string(static_cast<long long>(std::floor(*hi))) : std::string("std::nullopt")) +
-               ")"};
+               ")",
+           "s2c::int_writer()"};
     } else if (type == "number") {
       auto lo = get_num(schema, "minimum"), hi = get_num(schema, "maximum");
       r = {"double", "s2c::number_reader(" + (lo ? dbl(*lo) : std::string("std::nullopt")) + ", " +
-                         (hi ? dbl(*hi) : std::string("std::nullopt")) + ")"};
+                         (hi ? dbl(*hi) : std::string("std::nullopt")) + ")",
+         "s2c::number_writer()"};
     } else if (type == "boolean") {
-      r = {"bool", "s2c::bool_reader()"};
+      r = {"bool", "s2c::bool_reader()", "s2c::bool_writer()"};
     } else if (type == "null") {
-      r = {"std::nullptr_t", "s2c::null_reader()"};
+      r = {"std::nullptr_t", "s2c::null_reader()", "s2c::null_writer()"};
     } else if (type == "array") {
-      Resolved item{"s2c::Value", "s2c::any_reader()"};
+      Resolved item{"s2c::Value", "s2c::any_reader()", "s2c::any_writer()"};
       if (const Value* items = get(schema, "items")) item = resolve(*items, name_hint + "Item");
       r = {"std::vector<" + item.type + ">", "s2c::array_reader(" + item.reader + ", " +
                                                  opt_size(schema, "minItems") + ", " +
-                                                 opt_size(schema, "maxItems") + ")"};
+                                                 opt_size(schema, "maxItems") + ")",
+         "s2c::array_writer(" + item.writer + ")"};
     } else if (type == "object") {
       r = get(schema, "properties") ? emit_class(schema, name_hint)
-                                    : Resolved{"s2c::Value", "s2c::any_object_reader()"};
+                                    : Resolved{"s2c::Value", "s2c::any_object_reader()", "s2c::any_writer()"};
     } else if (type.empty()) {
-      r = {"s2c::Value", "s2c::any_reader()"};
+      r = {"s2c::Value", "s2c::any_reader()", "s2c::any_writer()"};
     } else {
       die("unknown type '" + type + "' at " + name_hint);
     }
 
-    if (nullable) r = {"std::optional<" + r.type + ">", "s2c::nullable(" + r.reader + ")", r.cls};
+    if (nullable) r = {"std::optional<" + r.type + ">", "s2c::nullable(" + r.reader + ")",
+           "s2c::nullable_writer(" + r.writer + ")", r.cls};
     return r;
   }
 
@@ -447,7 +458,7 @@ class Generator {
     if (const Value* ap = get(schema, "additionalProperties"))
       if (ap->type() == Value::Type::Bool && !ap->as_bool()) allow_extra = false;
 
-    std::ostringstream decls, inits, keys, params, copies;
+    std::ostringstream decls, inits, keys, params, copies, writes;
     std::set<std::string> member_names;
     bool first = true;
     for (const auto& [key, sub] : props->as_object().items()) {
@@ -463,6 +474,9 @@ class Generator {
       decls << "  " << type << " " << id << ";\n";
       inits << (first ? "      : " : ",\n        ") << id << "(s2c::" << (is_req ? "required" : "optional_prop")
             << "(jobj, " << cpp_str(key) << ", jpath, " << r.reader << "))";
+      const char* put = is_req ? "put_required"
+                        : r.type.rfind("std::optional<", 0) == 0 ? "put_nullable" : "put_optional";
+      writes << "    jw." << put << "(" << cpp_str(key) << ", " << id << ", " << r.writer << ", jpath);\n";
       keys << (first ? "" : ", ") << cpp_str(key);
       params << ", " << type << " " << id;
       copies << (copies.tellp() > 0 ? ", " : "") << id << "(std::move(" << id << "))";
@@ -483,12 +497,31 @@ class Generator {
     o << "  // Builds directly from values, with no parsing or validation (used for embedded data).\n"
       << "  " << cls << "(s2c::from_members_t" << params.str() << ")"
       << (first ? "" : " : " + copies.str()) << " {}\n\n";
+    o << "  /// The JSON value of this object. If `jexisting` is an object it is updated rather than\n"
+      << "  /// replaced: keys keep their order and new ones are appended"
+      << (allow_extra ? ", and keys not in the schema are kept.\n"
+                      : "; the schema forbids additional properties, so unknown keys are dropped.\n")
+      << "  s2c::Value to_value(const s2c::Value* jexisting = nullptr, const std::string& jpath = \"$\") const {\n"
+      << "    s2c::ObjectWriter jw(jexisting, {" << keys.str() << "}, " << (allow_extra ? "true" : "false")
+      << ");\n"
+      << writes.str() << "    return jw.finish();\n  }\n\n";
+    o << "  /// Returns `json_text` (a JSON object) with the members of this object written into it.\n"
+      << "  /// Keys the schema does not describe are preserved (not if additionalProperties is false);\n"
+      << "  /// key order is kept, but whitespace is not. `indent` < 0 gives compact output.\n"
+      << "  /// Throws s2c::ParseError for malformed text, s2c::ValidationError if the text is not an\n"
+      << "  /// object or if the current member values do not satisfy the schema.\n"
+      << "  std::string update(std::string_view json_text, int indent = -1) const {\n"
+      << "    const s2c::Value jdoc = s2c::parse(json_text);\n"
+      << "    s2c::expect(jdoc, s2c::Value::Type::Object, \"$\");\n"
+      << "    const s2c::Value jmerged = to_value(&jdoc);\n"
+      << "    (void)" << cls << "(jmerged);  // never emit JSON that violates the schema\n"
+      << "    return s2c::to_json(jmerged, indent);\n  }\n\n";
     o << " private:\n  struct Tag {};\n  " << cls << "(const s2c::Object& jobj, const std::string& jpath, Tag)";
     if (first) o << " {\n    (void)jobj;\n    (void)jpath;\n  }\n";
     else o << "\n" << inits.str() << " {}\n";
     o << "};\n\n";
     classes_ += o.str();
-    return {cls, "s2c::object_reader<" + cls + ">()", cls};
+    return {cls, "s2c::object_reader<" + cls + ">()", "s2c::object_writer<" + cls + ">()", cls};
   }
 };
 

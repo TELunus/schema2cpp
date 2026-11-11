@@ -8,6 +8,13 @@ person_hpp = custom_target(
   command: [schema2cpp_exe, '@INPUT@', '-o', '@OUTPUT@', '--name', 'Person'],
 )
 
+settings_hpp = custom_target(
+  'settings_hpp',
+  input: files('data/settings.schema.json'),
+  output: 'settings.hpp',
+  command: [schema2cpp_exe, '@INPUT@', '-o', '@OUTPUT@', '--name', 'Settings', '--namespace', 'settings'],
+)
+
 # Embedded path: data is checked at generation time and compiled in.
 embedded_hpp = custom_target(
   'person_embedded_hpp',
@@ -19,6 +26,9 @@ embedded_hpp = custom_target(
 
 test('generated class validates JSON',
   executable('test_runtime', 'test_runtime.cpp', person_hpp, dependencies: s2c_runtime_dep))
+
+test('update() merges into existing JSON',
+  executable('test_update', 'test_update.cpp', person_hpp, settings_hpp, dependencies: s2c_runtime_dep))
 
 test('parser edge cases',
   executable('test_parser', 'test_parser.cpp', dependencies: s2c_runtime_dep))

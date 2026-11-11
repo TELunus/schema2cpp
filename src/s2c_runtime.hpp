@@ -5,8 +5,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <optional>
 #include <stdexcept>
@@ -265,5 +268,274 @@ auto optional_prop(const Object& obj, std::string_view key, const std::string& p
   if (!f) return Out{};
   return Out(reader(*f, join_key(path, key)));
 }
+
+// ---------------------------------------------------------------------------
+// Serialization, and the "writers" used by generated to_value() / update().
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+inline bool valid_utf8(const std::string& s) {
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(s.data());
+  const unsigned char* end = p + s.size();
+  while (p < end) {
+    const unsigned char c = *p++;
+    if (c < 0x80) continue;
+    std::ptrdiff_t extra;
+    std::uint32_t cp, min;
+    if (c >= 0xC2 && c <= 0xDF) { extra = 1; cp = c & 0x1Fu; min = 0x80; }
+    else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0Fu; min = 0x800; }
+    else if (c >= 0xF0 && c <= 0xF4) { extra = 3; cp = c & 0x07u; min = 0x10000; }
+    else return false;
+    if (end - p < extra) return false;
+    for (std::ptrdiff_t i = 0; i < extra; ++i) {
+      if ((p[i] & 0xC0) != 0x80) return false;
+      cp = (cp << 6) | (p[i] & 0x3Fu);
+    }
+    p += extra;
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+  }
+  return true;
+}
+
+inline void write_string(std::string& out, const std::string& s) {
+  if (!valid_utf8(s)) throw ValidationError("string is not valid UTF-8");
+  out += '"';
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof buf, "\\u%04x", c);
+          out += buf;
+        } else {
+          out += static_cast<char>(c);
+        }
+    }
+  }
+  out += '"';
+}
+
+inline void write_number(std::string& out, const Value::Number& n) {
+  if (n.is_int) {
+    out += std::to_string(n.i);
+    return;
+  }
+  if (!std::isfinite(n.d)) throw ValidationError("cannot represent a non-finite number in JSON");
+  char buf[40];
+  // Shortest of 15..17 significant digits that reads back as the same double.
+  for (int prec = 15; prec <= 17; ++prec) {
+    std::snprintf(buf, sizeof buf, "%.*g", prec, n.d);
+    if (prec == 17 || std::strtod(buf, nullptr) == n.d) break;
+  }
+  out += buf;
+}
+
+inline void write_value(std::string& out, const Value& v, int indent, int depth) {
+  auto newline = [&](int d) {
+    if (indent < 0) return;
+    out += '\n';
+    out.append(static_cast<std::size_t>(indent) * static_cast<std::size_t>(d), ' ');
+  };
+  switch (v.type()) {
+    case Value::Type::Null: out += "null"; break;
+    case Value::Type::Bool: out += v.as_bool() ? "true" : "false"; break;
+    case Value::Type::Number: write_number(out, v.as_number()); break;
+    case Value::Type::String: write_string(out, v.as_string()); break;
+    case Value::Type::Array: {
+      const Value::Array& a = v.as_array();
+      if (a.empty()) { out += "[]"; break; }
+      out += '[';
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (i) out += ',';
+        newline(depth + 1);
+        write_value(out, a[i], indent, depth + 1);
+      }
+      newline(depth);
+      out += ']';
+      break;
+    }
+    case Value::Type::Object: {
+      const Object& o = v.as_object();
+      if (o.size() == 0) { out += "{}"; break; }
+      out += '{';
+      bool first = true;
+      for (const auto& kv : o.items()) {
+        if (!first) out += ',';
+        first = false;
+        newline(depth + 1);
+        write_string(out, kv.first);
+        out += indent < 0 ? ":" : ": ";
+        write_value(out, kv.second, indent, depth + 1);
+      }
+      newline(depth);
+      out += '}';
+      break;
+    }
+  }
+}
+
+}  // namespace detail
+
+// Serializes a Value as JSON. indent < 0 gives compact output; indent >= 0 pretty-prints
+// with that many spaces per level. Object keys keep their insertion order. Throws
+// ValidationError for text that is not valid UTF-8 and for NaN/infinity.
+inline std::string to_json(const Value& v, int indent = -1) {
+  std::string out;
+  detail::write_value(out, v, indent, 0);
+  return out;
+}
+
+// A "writer" is any callable (const T&, const Value* existing, const std::string& path) -> Value,
+// the inverse of a reader. `existing` is the matching part of the document being updated (or
+// nullptr); only object and array writers use it, to keep what the class does not model.
+
+inline auto string_writer() {
+  return [](const std::string& s, const Value*, const std::string& path) -> Value {
+    if (!detail::valid_utf8(s)) fail(path, "string is not valid UTF-8");
+    return Value::make_string(s);
+  };
+}
+
+inline auto int_writer() {
+  return [](std::int64_t i, const Value*, const std::string&) -> Value {
+    Value::Number n;
+    n.i = i;
+    n.d = static_cast<double>(i);
+    n.is_int = true;
+    return Value::make_number(n);
+  };
+}
+
+inline auto number_writer() {
+  return [](double d, const Value*, const std::string& path) -> Value {
+    if (!std::isfinite(d)) fail(path, "cannot represent a non-finite number in JSON");
+    Value::Number n;
+    n.d = d;
+    if (d == std::floor(d) && std::fabs(d) < 9.2e18) {  // same rule as the parser
+      n.i = static_cast<std::int64_t>(d);
+      n.is_int = true;
+    }
+    return Value::make_number(n);
+  };
+}
+
+inline auto bool_writer() {
+  return [](bool b, const Value*, const std::string&) -> Value { return Value::make_bool(b); };
+}
+
+inline auto null_writer() {
+  return [](std::nullptr_t, const Value*, const std::string&) -> Value { return Value(); };
+}
+
+// Values the class holds verbatim (schema {} or free-form objects) are written back as they are.
+inline auto any_writer() {
+  return [](const Value& v, const Value*, const std::string&) -> Value { return v; };
+}
+
+template <class T>
+auto object_writer() {
+  return [](const T& o, const Value* existing, const std::string& path) -> Value {
+    return o.to_value(existing, path);
+  };
+}
+
+// Elements are merged with the element at the same index of the existing array (if any), so
+// properties the class does not model survive edits made in place.
+template <class Item>
+auto array_writer(Item item) {
+  return [=](const auto& vec, const Value* existing, const std::string& path) -> Value {
+    const Value::Array* old =
+        existing && existing->type() == Value::Type::Array ? &existing->as_array() : nullptr;
+    Value::Array out;
+    out.reserve(vec.size());
+    for (std::size_t i = 0; i < vec.size(); ++i)
+      out.push_back(item(vec[i], old && i < old->size() ? &(*old)[i] : nullptr, join_index(path, i)));
+    return Value::make_array(std::move(out));
+  };
+}
+
+template <class Inner>
+auto nullable_writer(Inner inner) {
+  return [=](const auto& opt, const Value* existing, const std::string& path) -> Value {
+    if (!opt) return Value();
+    return inner(*opt, existing, path);
+  };
+}
+
+// Builds the object Value for a generated class, merging into the existing document's object:
+//  - keys keep the order they had in the existing object; new keys are appended
+//  - keys the class does not know are kept, unless the schema has additionalProperties: false
+class ObjectWriter {
+ public:
+  ObjectWriter(const Value* existing, std::initializer_list<const char*> known, bool keep_extra) {
+    if (!existing || existing->type() != Value::Type::Object) return;
+    old_ = &existing->as_object();
+    for (const auto& item : old_->items()) {
+      bool is_known = false;
+      for (const char* k : known) is_known = is_known || item.first == k;
+      if (is_known) slots_.push_back(Slot{item.first, Value(), false});  // placeholder keeps position
+      else if (keep_extra) slots_.push_back(Slot{item.first, item.second, true});
+    }
+  }
+
+  // Required property (also used for a required nullable one: the writer maps nullopt to null).
+  template <class T, class W>
+  void put_required(std::string_view key, const T& v, const W& writer, const std::string& path) {
+    set(key, writer(v, child(key), join_key(path, key)));
+  }
+
+  // Optional property: nullopt removes the key.
+  template <class T, class W>
+  void put_optional(std::string_view key, const std::optional<T>& v, const W& writer,
+                    const std::string& path) {
+    if (v) put_required(key, *v, writer, path);
+  }
+
+  // Optional *and* nullable property (std::optional cannot tell "absent" from "null"): nullopt
+  // becomes null if the key is already in the document, and stays absent otherwise.
+  template <class T, class W>
+  void put_nullable(std::string_view key, const std::optional<T>& v, const W& writer,
+                    const std::string& path) {
+    if (v || child(key)) put_required(key, v, writer, path);
+  }
+
+  Value finish() {
+    Object o;
+    for (Slot& s : slots_)
+      if (s.present) o.add(std::move(s.key), std::move(s.val));
+    return Value::make_object(std::move(o));
+  }
+
+ private:
+  struct Slot {
+    std::string key;
+    Value val;
+    bool present;
+  };
+
+  const Value* child(std::string_view key) const { return old_ ? old_->find(key) : nullptr; }
+
+  void set(std::string_view key, Value v) {
+    for (Slot& s : slots_) {
+      if (s.key == key) {
+        s.val = std::move(v);
+        s.present = true;
+        return;
+      }
+    }
+    slots_.push_back(Slot{std::string(key), std::move(v), true});
+  }
+
+  const Object* old_ = nullptr;
+  std::vector<Slot> slots_;
+};
 
 }  // namespace s2c
