@@ -41,8 +41,10 @@ class Object {
   using Item = std::pair<std::string, Value>;
   const Value* find(std::string_view key) const;
   void add(std::string key, Value v);  // throws ParseError on duplicate key
-  const std::vector<Item>& items() const { return items_; }
-  std::size_t size() const { return items_.size(); }
+  // Defined below, once Value is complete: with libc++, std::vector<Item>::size()
+  // instantiates std::pair<std::string, Value>, which needs a complete Value.
+  const std::vector<Item>& items() const;
+  std::size_t size() const;
 
  private:
   std::vector<Item> items_;
@@ -99,6 +101,8 @@ inline void Object::add(std::string key, Value v) {
   if (find(key)) throw ParseError("duplicate object key '" + key + "'");
   items_.emplace_back(std::move(key), std::move(v));
 }
+inline const std::vector<Object::Item>& Object::items() const { return items_; }
+inline std::size_t Object::size() const { return items_.size(); }
 
 // Tag for the generated "construct from member values" constructors.
 struct from_members_t {};
