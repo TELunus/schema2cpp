@@ -1,0 +1,8 @@
+[wrap-git]
+url = git@github.com:KhronosGroup/glTF.git
+revision = 5961f897c1cfe51b8e270b2e905d529e2c6127d4
+depth = 1
+patch_directory = gltf-schema
+
+[provide]
+gltf-schema = gltf_schema_dep

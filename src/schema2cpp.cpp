@@ -18,8 +18,10 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <sstream>
+#include <utility>
 
 #include "s2c_runtime.hpp"
 
@@ -136,7 +138,8 @@ struct TypeInfo {
 
 class Generator {
  public:
-  Generator(const Value& root, std::string ns) : root_(root), ns_(std::move(ns)) {}
+  Generator(const Value& root, std::string ns, std::string schema_dir)
+      : root_(root), ns_(std::move(ns)), schema_dir_(std::move(schema_dir)) {}
 
   std::string run(const std::string& root_name, const Value* data = nullptr,
                   const std::string& data_name = "", const std::string& data_file = "") {
@@ -163,10 +166,13 @@ class Generator {
  private:
   const Value& root_;
   std::string ns_;
+  std::string schema_dir_;
   std::string classes_;
   std::set<std::string> used_names_;
   std::map<std::string, Resolved> ref_cache_;
   std::set<std::string> ref_in_progress_;
+  std::map<std::string, Value> loaded_schemas_;
+  std::vector<std::unique_ptr<Value>> synthesized_;
 
   void warn(const std::string& msg) { std::cerr << "warning: " << msg << "\n"; }
 
@@ -177,8 +183,26 @@ class Generator {
     return name;
   }
 
+  const Value& load_schema(const std::string& path) {
+    auto it = loaded_schemas_.find(path);
+    if (it != loaded_schemas_.end()) return it->second;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) die("cannot open referenced schema " + path);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    Value v = s2c::parse(buf.str());
+    return loaded_schemas_.emplace(path, std::move(v)).first->second;
+  }
+
   const Value& follow_ref(const std::string& ref) {
-    if (ref.rfind("#", 0) != 0) die("only local \"$ref\"s are supported, got " + ref);
+    if (ref.rfind("#", 0) != 0) {
+      if (schema_dir_.empty())
+        die("only local \"$ref\"s are supported unless --schema-dir is given, got " + ref);
+      std::string path = schema_dir_;
+      if (!path.empty() && path.back() != '/' && path.back() != '\\') path += '/';
+      path += ref;
+      return load_schema(path);
+    }
     const Value* cur = &root_;
     std::stringstream ss(ref.substr(1));
     std::string seg;
@@ -195,6 +219,121 @@ class Generator {
       if (!cur) die("cannot resolve $ref " + ref);
     }
     return *cur;
+  }
+
+  // Flatten a schema that has $ref + local keywords into a merged schema.
+  // If the schema has no $ref, or only $ref (+metadata), returns the original.
+  const Value& flatten_ref(const Value& schema) {
+    const Value* ref = get(schema, "$ref");
+    if (!ref || ref->type() != Value::Type::String) return schema;
+
+    // Check if schema only contains $ref and metadata (no additional keywords to merge).
+    bool has_extra = false;
+    for (const auto& kv : schema.as_object().items()) {
+      const std::string& k = kv.first;
+      if (k != "$ref" && k != "$id" && k != "$schema" && k != "title" &&
+          k != "description" && k != "gltf_detailedDescription" &&
+          k != "gltf_sectionDescription") {
+        has_extra = true;
+        break;
+      }
+    }
+    if (!has_extra) return schema;
+
+    // Merge: follow ref target, then overlay local keywords.
+    // Recursively flatten the base first.
+    const Value& base = flatten_ref(follow_ref(ref->as_string()));
+    if (base.type() != Value::Type::Object) return base;
+
+    synthesized_.push_back(std::make_unique<Value>());
+    Value& merged = *synthesized_.back();
+    s2c::Object obj;
+
+    // Copy all keywords from base except properties/required/additionalProperties.
+    for (const auto& kv : base.as_object().items()) {
+      const std::string& k = kv.first;
+      if (k == "properties" || k == "required" || k == "additionalProperties")
+        continue;
+      obj.add(k, kv.second);
+    }
+
+    // Merge properties: base then local (local wins on conflict).
+    std::vector<std::pair<std::string, Value>> props;
+    std::set<std::string> seen;
+    auto add_props = [&](const Value& src) {
+      if (const Value* p = get(src, "properties"); p && p->type() == Value::Type::Object) {
+        for (const auto& kv : p->as_object().items()) {
+          if (!seen.count(kv.first)) {
+            props.emplace_back(kv.first, kv.second);
+            seen.insert(kv.first);
+          }
+        }
+      }
+    };
+    add_props(base);
+    add_props(schema);
+    if (!props.empty()) {
+      s2c::Object pobj;
+      for (auto& pr : props) pobj.add(pr.first, pr.second);
+      obj.add("properties", Value::make_object(std::move(pobj)));
+    }
+
+    // Merge required: union of base and local.
+    std::set<std::string> req;
+    auto add_req = [&](const Value& src) {
+      if (const Value* r = get(src, "required"); r && r->type() == Value::Type::Array) {
+        for (const Value& v : r->as_array())
+          if (v.type() == Value::Type::String) req.insert(v.as_string());
+      }
+    };
+    add_req(base);
+    add_req(schema);
+    if (!req.empty()) {
+      Value::Array arr;
+      for (const auto& r : req) arr.push_back(Value::make_string(r));
+      obj.add("required", Value::make_array(std::move(arr)));
+    }
+
+    // additionalProperties: local overrides base.
+    const Value* lap = get(schema, "additionalProperties");
+    const Value* bap = get(base, "additionalProperties");
+    if (lap) obj.add("additionalProperties", *lap);
+    else if (bap) obj.add("additionalProperties", *bap);
+
+    merged = Value::make_object(std::move(obj));
+    return merged;
+  }
+
+  // Infers the common type of an anyOf/oneOf union. The glTF schema uses the
+  // idiom [{const: A, type: T}, ..., {type: T}] where the trailing branch accepts
+  // any T, so the union's effective type is simply T. Returns "" when the
+  // branches disagree or impose no type.
+  static std::string union_type(const Value::Array& branches) {
+    std::string found;
+    for (const Value& b : branches) {
+      std::string bt;
+      if (const Value* t = get(b, "type"); t && t->type() == Value::Type::String) {
+        bt = t->as_string();
+      } else if (const Value* c = get(b, "const"); c) {
+        switch (c->type()) {
+          case Value::Type::Number: bt = c->as_number().is_int ? "integer" : "number"; break;
+          case Value::Type::String: bt = "string"; break;
+          case Value::Type::Bool: bt = "boolean"; break;
+          case Value::Type::Null: bt = "null"; break;
+          default: break;
+        }
+      }
+      if (bt.empty()) continue;  // branch imposes no type
+      if (found.empty()) found = bt;
+      else if (found != bt) {
+        // "integer" is a subset of "number"; a union of both is "number".
+        if ((found == "integer" && bt == "number") || (found == "number" && bt == "integer"))
+          found = "number";
+        else
+          return "";
+      }
+    }
+    return found;
   }
 
   TypeInfo type_info(const Value& schema, const std::string& name_hint) {
@@ -218,6 +357,10 @@ class Generator {
         else die("union types are not supported at " + name_hint);
       }
       if (type.empty()) type = "null";
+    } else if (const Value* u = get(schema, "anyOf"); u && u->type() == Value::Type::Array) {
+      type = union_type(u->as_array());
+    } else if (const Value* u = get(schema, "oneOf"); u && u->type() == Value::Type::Array) {
+      type = union_type(u->as_array());
     } else if (get(schema, "properties")) {
       type = "object";
     } else if (get(schema, "items")) {
@@ -248,6 +391,12 @@ class Generator {
 
     if (const Value* ref = get(schema, "$ref")) {
       if (ref->type() != Value::Type::String) die("\"$ref\" must be a string");
+      bool has_extra = get(schema, "properties") != nullptr || get(schema, "required") != nullptr ||
+                       get(schema, "additionalProperties") != nullptr;
+      if (has_extra) {
+        const Value& merged = flatten_ref(schema);
+        return resolve(merged, name_hint);
+      }
       const std::string& key = ref->as_string();
       auto hit = ref_cache_.find(key);
       if (hit != ref_cache_.end()) return hit->second;
@@ -260,7 +409,12 @@ class Generator {
       return r;
     }
 
-    for (const char* kw : {"anyOf", "oneOf", "allOf", "not", "if", "patternProperties"})
+    for (const char* kw : {"anyOf", "oneOf"}) {
+      const Value* u = get(schema, kw);
+      if (u && u->type() == Value::Type::Array && union_type(u->as_array()).empty())
+        warn(std::string("'") + kw + "' has branches with no common type and is ignored at " + name_hint);
+    }
+    for (const char* kw : {"allOf", "not", "if", "patternProperties"})
       if (get(schema, kw)) warn(std::string("'") + kw + "' is not supported and is ignored at " + name_hint);
     for (const char* kw : {"pattern", "format", "uniqueItems", "multipleOf", "const", "exclusiveMinimum",
                            "exclusiveMaximum"})
@@ -356,7 +510,15 @@ class Generator {
 
   std::string data_expr(const Value& schema, const Value& data, const std::string& path) {
     if (schema.type() == Value::Type::Bool) return value_expr(data);
-    if (const Value* ref = get(schema, "$ref")) return data_expr(follow_ref(ref->as_string()), data, path);
+    if (const Value* ref = get(schema, "$ref")) {
+      bool has_extra = get(schema, "properties") != nullptr || get(schema, "required") != nullptr ||
+                       get(schema, "additionalProperties") != nullptr;
+      if (has_extra) {
+        const Value& merged = flatten_ref(schema);
+        return data_expr(merged, data, path);
+      }
+      return data_expr(follow_ref(ref->as_string()), data, path);
+    }
 
     TypeInfo ti = type_info(schema, path);
     if (data.type() == Value::Type::Null && ti.nullable) return "std::nullopt";
@@ -528,7 +690,7 @@ class Generator {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string schema_path, out_path, name, ns, data_path, data_name;
+  std::string schema_path, out_path, name, ns, data_path, data_name, schema_dir;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string {
@@ -541,6 +703,7 @@ int main(int argc, char** argv) {
       else if (a == "--namespace") ns = next();
       else if (a == "--data") data_path = next();
       else if (a == "--data-name") data_name = next();
+      else if (schema_dir.empty() && a == "--schema-dir") schema_dir = next();
       else if (schema_path.empty()) schema_path = a;
       else die("unexpected argument " + a);
     } catch (const std::exception& e) {
@@ -584,7 +747,7 @@ int main(int argc, char** argv) {
         data_name = ident(stem.substr(0, stem.find('.')), "") + "_data";
       }
     }
-    std::string header = Generator(schema, ns).run(name, data ? &*data : nullptr, data_name, data_path);
+    std::string header = Generator(schema, ns, schema_dir).run(name, data ? &*data : nullptr, data_name, data_path);
     if (out_path.empty()) {
       std::cout << header;
     } else {

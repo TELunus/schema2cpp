@@ -1,0 +1,10 @@
+[wrap-file]
+directory = gltf-generated-assets-0.6.1
+lead_directory_missing = true
+source_url = https://github.com/KhronosGroup/glTF-Asset-Generator/releases/download/v0.6.1/GeneratedAssets-0.6.1.zip
+source_filename = GeneratedAssets-0.6.1.zip
+source_hash = 4134d685f6ee4e7a27f3ec826c62566c86cca07ca23edba1150222b04ea074d1
+patch_directory = gltf-generated-assets
+
+[provide]
+gltf-generated-assets = gltf_generated_assets_dep

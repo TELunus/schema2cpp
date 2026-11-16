@@ -6,7 +6,7 @@ the JSON is malformed or does not match the schema.
 
 ```
 schema2cpp schema.json [-o out.hpp] [--name Root] [--namespace ns]
-                       [--data data.json [--data-name accessor]]
+                       [--schema-dir dir] [--data data.json [--data-name accessor]]
 ```
 
 ## Two ways to use the generated header
@@ -70,9 +70,17 @@ Types `string`, `integer`, `number`, `boolean`, `null`, `array`, `object`;
 `["T","null"]` (becomes `std::optional<T>`); non-required properties
 (`std::optional<T>`); nested objects and local `$ref` (`$defs`/`definitions`);
 `required`; `additionalProperties: false`; string `enum`; `minimum`/`maximum`;
-`minLength`/`maxLength`; `minItems`/`maxItems`. Other keywords (`pattern`, `format`,
-`oneOf`/`anyOf`/`allOf`, `exclusiveMinimum`, ...) are ignored with a warning.
+`minLength`/`maxLength`; `minItems`/`maxItems`. A `$ref` with sibling keywords
+(`properties`, `required`, `additionalProperties`) is merged, so schemas that
+spread one object across several files work. `anyOf`/`oneOf` whose branches all
+share one type (e.g. glTF's `[{const: A, type: T}, ..., {type: T}]`) is treated
+as plain type `T`. Other keywords (`pattern`, `format`, `oneOf`/`anyOf`/`allOf`
+with no common type, `exclusiveMinimum`, ...) are ignored with a warning.
 Recursive schemas, union types and non-string enums are rejected.
+
+Schemas that reference other files by relative path (as the Khronos glTF 2.0
+schema does) need `--schema-dir`: it is the directory the file `$ref`s are
+resolved against, e.g. `schema2cpp glTF.schema.json --schema-dir . -o gltf.hpp`.
 
 ## Building
 
